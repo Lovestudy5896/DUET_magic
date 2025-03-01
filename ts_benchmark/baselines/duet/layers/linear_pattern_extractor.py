@@ -1,23 +1,24 @@
 import torch
 import torch.nn as nn
 from ..layers.Autoformer_EncDec import series_decomp
-from pprint import pprint
+
 
 class Linear_extractor(nn.Module):
     """
     Paper link: https://arxiv.org/pdf/2205.13504.pdf
     """
 
-    def __init__(self, configs, individual=False):
+    def __init__(self, configs,kernel_size=0, individual=False):
         """
         individual: Bool, whether shared model among different variates.
         """
         super(Linear_extractor, self).__init__()
         self.seq_len = configs.seq_len
-        
+        from pprint import pprint
         pprint(vars(configs))
         self.pred_len = configs.d_model
-        self.decompsition = series_decomp(configs.moving_avg)#相同的kernelsize
+        #self.decompsition = series_decomp(configs.moving_avg)#相同的kernelsize
+        self.decompsition = series_decomp(kernel_size)
         self.individual = individual
         self.channels = configs.enc_in
         self.enc_in = 1 if configs.CI else configs.enc_in

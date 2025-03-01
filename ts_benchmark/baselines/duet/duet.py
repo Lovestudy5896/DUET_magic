@@ -57,9 +57,13 @@ DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
 class TransformerConfig:
     def __init__(self, **kwargs):
         for key, value in DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS.items():
+            #print(key)
+            #print(value)
             setattr(self, key, value)
 
         for key, value in kwargs.items():
+            #print(key)
+            #print(value)
             setattr(self, key, value)
 
     @property

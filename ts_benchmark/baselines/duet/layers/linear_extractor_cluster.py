@@ -67,10 +67,10 @@ class SparseDispatcher(object):
         """
 
         # assigns samples to experts whose gate is nonzero
-
+        #inp [batch_size, input_size]
         # expand according to batch index so we can just split by _part_sizes
-        inp_exp = inp[self._batch_index].squeeze(1)
-        return torch.split(inp_exp, self._part_sizes, dim=0)
+        inp_exp = inp[self._batch_index].squeeze(1)#[num_nonzero_gates, input_size]
+        return torch.split(inp_exp, self._part_sizes, dim=0)#切成对于每个专家的输入
 
     def combine(self, expert_out, multiply_by_gates=True):
         """Sum together the expert output, weighted by the gates.
@@ -123,10 +123,13 @@ class Linear_extractor_cluster(nn.Module):
         super(Linear_extractor_cluster, self).__init__()
         self.noisy_gating = config.noisy_gating
         self.num_experts = config.num_experts
+        
         self.input_size = config.seq_len
         self.k = config.k
         # instantiate experts
-        self.experts = nn.ModuleList([expert(config) for _ in range(self.num_experts)])
+        #self.experts = nn.ModuleList([expert(config) for _ in range(self.num_experts)])
+        kernel_sizes = [13 + 12 * i for i in range(self.num_experts)]
+        self.experts = nn.ModuleList([expert(config, param) for param in kernel_sizes])
         self.W_h = nn.Parameter(torch.eye(self.num_experts))
         self.gate = encoder(config)
         self.noise = encoder(config)
