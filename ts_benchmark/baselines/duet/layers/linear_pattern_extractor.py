@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from ..layers.Autoformer_EncDec import series_decomp
-
+from ..utils.Other import  FourierLayer
 
 class Linear_extractor(nn.Module):
     """
@@ -19,6 +19,7 @@ class Linear_extractor(nn.Module):
         self.pred_len = configs.d_model
         #self.decompsition = series_decomp(configs.moving_avg)#相同的kernelsize
         self.decompsition = series_decomp(kernel_size)
+        self.seasonality_model = FourierLayer(pred_len=0, k=3)
         self.individual = individual
         self.channels = configs.enc_in
         self.enc_in = 1 if configs.CI else configs.enc_in
@@ -51,7 +52,10 @@ class Linear_extractor(nn.Module):
 
 
     def encoder(self, x):
-        seasonal_init, trend_init = self.decompsition(x)#分解，AvgPool
+        pre_x = x
+        seasonal_init, _ = self.seasonality_model(x)
+        #seasonal_init, trend_init = self.decompsition(x)#分解，AvgPool
+        _, trend_init = self.decompsition(x)
         seasonal_init, trend_init = seasonal_init.permute(
             0, 2, 1), trend_init.permute(0, 2, 1)
         if self.individual:
@@ -68,7 +72,7 @@ class Linear_extractor(nn.Module):
             seasonal_output = self.Linear_Seasonal(seasonal_init)
             trend_output = self.Linear_Trend(trend_init)
         x = seasonal_output + trend_output
-        return x.permute(0, 2, 1)
+        return x.permute(0, 2, 1)+pre_x
 
     def forecast(self, x_enc):
         # Encoder
