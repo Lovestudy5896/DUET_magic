@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.normal import Normal
 from .linear_pattern_extractor import Linear_extractor as expert
+from .AttentionExpert import AttentionExpert as attention_expert
 from .shared_extractor import Shared_extractor 
 from .distributional_router_encoder import encoder
 from ..layers.RevIN import RevIN
@@ -110,7 +111,7 @@ class SparseDispatcher(object):
         if multiply_by_gates:
             # stitched = stitched.mul(self._nonzero_gates)
             stitched = torch.einsum("i...,ij->i...", stitched, self._nonzero_gates)
-
+            
         shape = list(expert_out[-1].shape)
         shape[0] = self._gates.size(0)
         zeros = torch.zeros(*shape, requires_grad=True, device=stitched.device)
@@ -149,9 +150,12 @@ class Linear_extractor_cluster(nn.Module):
         self.k = config.k
         # instantiate experts
         #self.experts = nn.ModuleList([expert(config) for _ in range(self.num_experts)])
-        kernel_sizes = [13 + 12 * i for i in range(self.num_experts)]
+        # Add: attention experts
+        kernel_sizes = [13 + 12 * i for i in range(int(self.num_experts/2))]
         self.experts = nn.ModuleList([expert(config, param) for param in kernel_sizes])
-        self.shared_expert=Shared_extractor(config)#超参数
+        self.att_expert_num = self.num_experts - len(self.experts)
+        self.attn_experts= nn.ModuleList([attention_expert(config.d_model, config.n_heads) for _ in range(self.att_expert_num)])
+        self.shared_expert=Shared_extractor(config)
         self.W_h = nn.Parameter(torch.eye(self.num_experts))
         self.gate = encoder(config)
         self.noise = encoder(config)
@@ -278,9 +282,10 @@ class Linear_extractor_cluster(nn.Module):
             logits = clean_logits
 
         # calculate topk + 1 that will be needed for the noisy gates
-        #print(f'logits:{logits.shape}')
+       
         logits = self.softmax(logits)
         z_loss =self.router_z_loss(logits)
+       
         top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
         top_k_logits = top_logits[:, : self.k]
         top_k_indices = top_indices[:, : self.k]
@@ -299,6 +304,30 @@ class Linear_extractor_cluster(nn.Module):
             ).sum(0)
         else:
             load = self._gates_to_load(gates)
+        
+         # 软专家
+        '''
+            两种思路：
+            1. 通过设定一个阈值
+            2. 直接去掉topk，采用全部softmax=1的
+        '''
+        # # method1：
+        # gates = self.softmax(logits)  # Soft routing: 每个 token 所有专家都有门控值
+
+        # z_loss = self.router_z_loss(gates)
+
+        # # 不需要 topk、scatter、load = prob_in_top_k
+        # load = self._gates_to_load(gates)  # 每个专家的 load = 所有 token 对它的总权重
+        
+        # # method2:
+        # # Dynamically select experts based on a threshold
+        # gates = (logits > self.threshold).float() * logits  # Keep only logits above the threshold
+
+        # # Normalize gates for each token
+        # gates = gates / (gates.sum(dim=1, keepdim=True) + 1e-6)
+
+        # # Compute load for each expert
+        # load = gates.sum(0)
         return gates, load,z_loss
 
 
@@ -335,12 +364,19 @@ class Linear_extractor_cluster(nn.Module):
 
         expert_inputs = dispatcher.dispatch(x_norm) # expert[i]的size(0)是该专家处理的token数量
         gates = dispatcher.expert_to_gates()
-        expert_outputs = [
-            self.experts[i](expert_inputs[i]) for i in range(self.num_experts)
-        ]
-  
-        shared_output = self.shared_expert(x_norm)
+        
+        # 普通 expert 输出
+        expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(len(self.experts))]
+
+        # attention expert 输出
+        for i in range(self.att_expert_num):
+            x_att = expert_inputs[len(self.experts) + i].squeeze(-1).unsqueeze(0)  # [1, token_num, d_model]
+            attn_out = self.attn_experts[i](x_att)  # -> [1, token_num, d_model]
+            expert_outputs.append(attn_out.squeeze(0).unsqueeze(-1))  # [token_num, d_model, 1]
+
+        # 加上共享 expert 输出（如果有）
+        shared_output = self.shared_expert(x_norm)  # 可选
 
         y = dispatcher.combine(expert_outputs) + shared_output
         
-        return y, loss+z_loss*0.5
+        return y, loss+z_loss*0.2

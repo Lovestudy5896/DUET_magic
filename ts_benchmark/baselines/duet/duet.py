@@ -51,7 +51,10 @@ DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
     "noisy_gating": True,
     "k": 1,
     "CI": True,
-    "capacity_factor": 1.25
+    "capacity_factor": 1.25,
+    "threshold": 0.8,
+    "shareExpertKernelSize": 61
+
 }
 
 
@@ -64,6 +67,8 @@ class TransformerConfig:
         for key, value in kwargs.items():
 
             setattr(self, key, value)
+        
+        setattr(self, "d_model", self.seq_len)
 
     @property
     def pred_len(self):
