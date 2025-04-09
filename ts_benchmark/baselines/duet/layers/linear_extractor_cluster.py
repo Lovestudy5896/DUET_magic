@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.normal import Normal
 from .linear_pattern_extractor import Linear_extractor as expert
+from .shared_extractor import Shared_extractor 
 from .distributional_router_encoder import encoder
 from ..layers.RevIN import RevIN
 from einops import rearrange
@@ -150,7 +151,7 @@ class Linear_extractor_cluster(nn.Module):
         #self.experts = nn.ModuleList([expert(config) for _ in range(self.num_experts)])
         kernel_sizes = [13 + 12 * i for i in range(self.num_experts)]
         self.experts = nn.ModuleList([expert(config, param) for param in kernel_sizes])
-        self.shared_expert=expert(config,61)#超参数
+        self.shared_expert=Shared_extractor(config)#超参数
         self.W_h = nn.Parameter(torch.eye(self.num_experts))
         self.gate = encoder(config)
         self.noise = encoder(config)
