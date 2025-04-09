@@ -53,11 +53,12 @@ class Linear_extractor(nn.Module):
 
     def encoder(self, x):
         pre_x = x
+        
         seasonal_init, _ = self.seasonality_model(x)
         #seasonal_init, trend_init = self.decompsition(x)#分解，AvgPool
         _, trend_init = self.decompsition(x)
-        seasonal_init, trend_init = seasonal_init.permute(
-            0, 2, 1), trend_init.permute(0, 2, 1)
+        seasonal_init, trend_init = seasonal_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
+        
         if self.individual:
             seasonal_output = torch.zeros([seasonal_init.size(0), seasonal_init.size(1), self.pred_len],
                                           dtype=seasonal_init.dtype).to(seasonal_init.device)
@@ -71,6 +72,7 @@ class Linear_extractor(nn.Module):
         else:
             seasonal_output = self.Linear_Seasonal(seasonal_init)
             trend_output = self.Linear_Trend(trend_init)
+        
         x = seasonal_output + trend_output
         return x.permute(0, 2, 1)+pre_x
 

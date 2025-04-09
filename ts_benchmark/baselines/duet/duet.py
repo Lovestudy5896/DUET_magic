@@ -50,20 +50,19 @@ DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
     "num_experts": 4,
     "noisy_gating": True,
     "k": 1,
-    "CI": True
+    "CI": True,
+    "capacity_factor": 1.25
 }
 
 
 class TransformerConfig:
     def __init__(self, **kwargs):
         for key, value in DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS.items():
-            #print(key)
-            #print(value)
+
             setattr(self, key, value)
 
         for key, value in kwargs.items():
-            #print(key)
-            #print(value)
+
             setattr(self, key, value)
 
     @property

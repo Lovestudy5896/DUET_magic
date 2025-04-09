@@ -299,6 +299,14 @@ if __name__ == "__main__":
              "and the true values in evaluation result file",
     )
 
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=None,
+        help="Maximum capacity (number of tokens) each expert can process. "
+            "Excess tokens will be dropped.",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(

@@ -38,22 +38,41 @@ class SparseDispatcher(object):
     `Tensor`s for expert i only the batch elements for which `gates[b, i] > 0`.
     """
 
-    def __init__(self, num_experts, gates):
-        """Create a SparseDispatcher."""
-
+    def __init__(self, num_experts, gates, capacity):
         self._gates = gates
         self._num_experts = num_experts
-        # sort experts
-        sorted_experts, index_sorted_experts = torch.nonzero(gates).sort(0)
-        # drop indices
+
+        batch_size = gates.shape[0]
+        self._capacity = capacity
+
+        # Get top-k (k is set by user, here only non-zero gates are used)
+        nonzero_indices = torch.nonzero(gates, as_tuple=False)
+        expert_index = nonzero_indices[:, 1]
+        batch_index = nonzero_indices[:, 0]
+
+        # Limit per-expert capacity
+        mask = torch.zeros_like(gates, dtype=torch.bool)
+        for expert_id in range(num_experts):
+            indices = (expert_index == expert_id).nonzero(as_tuple=False).squeeze()
+            if indices.numel() > capacity:
+                selected = indices[:capacity]
+            else:
+                selected = indices
+            mask[batch_index[selected], expert_id] = True
+        gates = gates * mask.float()
+        self._gates = gates
+
+
+        # Recompute after masking
+        nonzero_indices = torch.nonzero(gates, as_tuple=False)
+        sorted_experts, index_sorted_experts = nonzero_indices.sort(0)
         _, self._expert_index = sorted_experts.split(1, dim=1)
-        # get according batch index for each expert
-        self._batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0]
-        # calculate num samples that each expert gets
+        self._batch_index = nonzero_indices[index_sorted_experts[:, 1], 0]
         self._part_sizes = (gates > 0).sum(0).tolist()
-        # expand gates to match with self._batch_index
+        
         gates_exp = gates[self._batch_index.flatten()]
         self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
+  
 
     def dispatch(self, inp):
         """Create one input Tensor for each expert.
@@ -123,13 +142,15 @@ class Linear_extractor_cluster(nn.Module):
         super(Linear_extractor_cluster, self).__init__()
         self.noisy_gating = config.noisy_gating
         self.num_experts = config.num_experts
-        
+        self.capacity_factor = config.capacity_factor
+        self.batch_size = config.batch_size
         self.input_size = config.seq_len
         self.k = config.k
         # instantiate experts
         #self.experts = nn.ModuleList([expert(config) for _ in range(self.num_experts)])
         kernel_sizes = [13 + 12 * i for i in range(self.num_experts)]
         self.experts = nn.ModuleList([expert(config, param) for param in kernel_sizes])
+        self.shared_expert=expert(config,61)#超参数
         self.W_h = nn.Parameter(torch.eye(self.num_experts))
         self.gate = encoder(config)
         self.noise = encoder(config)
@@ -211,7 +232,28 @@ class Linear_extractor_cluster(nn.Module):
         prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
         prob = torch.where(is_in, prob_if_in, prob_if_out)
         return prob
+    
+    
+    def router_z_loss(self,logits, num_microbatches=1, importance=None):
+        """Loss that encourages router logits to remain small and improves stability.
 
+        Args:
+            logits: a tensor with shape [<batch_dims>, experts_dim]
+            experts_dim: a Dimension (the number of experts)
+            num_microbatches: number of microbatches
+            importance: an optional tensor with shape [<batch_dims>, group_size_dim]
+
+        Returns:
+            z_loss: scalar loss only applied by non-padded tokens and normalized by
+            num_microbatches.
+        """
+        log_z = torch.logsumexp(logits, dim=-1)
+        z_loss = torch.square(log_z) 
+        denom = torch.sum(importance.eq(1.0)) if importance is not None else logits.shape[0]
+        z_loss = torch.sum(z_loss) / (denom * num_microbatches)
+        return z_loss
+    
+    
     def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
         """Noisy top-k gating.
         See paper: https://arxiv.org/abs/1701.06538.
@@ -235,7 +277,9 @@ class Linear_extractor_cluster(nn.Module):
             logits = clean_logits
 
         # calculate topk + 1 that will be needed for the noisy gates
+        #print(f'logits:{logits.shape}')
         logits = self.softmax(logits)
+        z_loss =self.router_z_loss(logits)
         top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
         top_k_logits = top_logits[:, : self.k]
         top_k_indices = top_indices[:, : self.k]
@@ -254,7 +298,9 @@ class Linear_extractor_cluster(nn.Module):
             ).sum(0)
         else:
             load = self._gates_to_load(gates)
-        return gates, load
+        return gates, load,z_loss
+
+
 
     def forward(self, x, loss_coef=1):
         """Args:
@@ -268,13 +314,17 @@ class Linear_extractor_cluster(nn.Module):
         training loss of the model.  The backpropagation of this loss
         encourages all experts to be approximately equally used across a batch.
         """
-        gates, load = self.noisy_top_k_gating(x, self.training)
+        gates, load,z_loss = self.noisy_top_k_gating(x, self.training)
         # calculate importance loss
         importance = gates.sum(0)
+       
         loss = self.cv_squared(importance) + self.cv_squared(load)
         loss *= loss_coef
-
-        dispatcher = SparseDispatcher(self.num_experts, gates)
+        
+        capacity = int((self.capacity_factor * x.shape[0]) // self.num_experts)
+        dispatcher = SparseDispatcher(self.num_experts, gates, capacity)
+        
+        # dispatcher = SparseDispatcher(self.num_experts, gates)
         if self.CI:
             x_norm = rearrange(x, "(x y) l c -> x l (y c)", y=self.n_vars)
             x_norm = self.revin(x_norm, "norm")
@@ -282,12 +332,14 @@ class Linear_extractor_cluster(nn.Module):
         else:
             x_norm = self.revin(x, "norm")
 
-        expert_inputs = dispatcher.dispatch(x_norm)
-
+        expert_inputs = dispatcher.dispatch(x_norm) # expert[i]的size(0)是该专家处理的token数量
         gates = dispatcher.expert_to_gates()
         expert_outputs = [
             self.experts[i](expert_inputs[i]) for i in range(self.num_experts)
         ]
-        y = dispatcher.combine(expert_outputs)
+  
+        shared_output = self.shared_expert(x_norm)
 
-        return y, loss
+        y = dispatcher.combine(expert_outputs) + shared_output
+        
+        return y, loss+z_loss*0.5
