@@ -7,7 +7,7 @@ from .shared_extractor import Shared_extractor
 from .distributional_router_encoder import encoder
 from ..layers.RevIN import RevIN
 from einops import rearrange
-
+from torch.nn import functional as F
 
 class SparseDispatcher(object):
     """Helper for implementing a mixture of experts.
@@ -259,17 +259,78 @@ class Linear_extractor_cluster(nn.Module):
         return z_loss
     
     
+    # def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
+    #     """Noisy top-k gating.
+    #     See paper: https://arxiv.org/abs/1701.06538.
+    #     Args:
+    #       x: input Tensor with shape [batch_size, input_size]
+    #       train: a boolean - we only add noise at training time.
+    #       noise_epsilon: a float
+    #     Returns:
+    #       gates: a Tensor with shape [batch_size, num_experts]
+    #       load: a Tensor with shape [num_experts]
+    #     """
+    #     clean_logits = self.gate(x)
+
+    #     if self.noisy_gating and train:
+    #         raw_noise_stddev = self.noise(x)
+    #         noise_stddev = self.softplus(raw_noise_stddev) + noise_epsilon
+    #         noise = torch.randn_like(clean_logits)
+    #         noisy_logits = clean_logits + (noise * noise_stddev)
+    #         logits = noisy_logits @ self.W_h
+    #     else:
+    #         logits = clean_logits
+
+    #     # calculate topk + 1 that will be needed for the noisy gates
+       
+    #     logits = self.softmax(logits)
+    #     z_loss =self.router_z_loss(logits)
+       
+    #     top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
+    #     top_k_logits = top_logits[:, : self.k]
+    #     top_k_indices = top_indices[:, : self.k]
+    #     top_k_gates = top_k_logits / (
+    #         top_k_logits.sum(1, keepdim=True) + 1e-6
+    #     )  # normalization
+
+    #     zeros = torch.zeros_like(logits, requires_grad=True)
+    #     gates = zeros.scatter(1, top_k_indices, top_k_gates)
+
+    #     if self.noisy_gating and self.k < self.num_experts and train:
+    #         load = (
+    #             self._prob_in_top_k(
+    #                 clean_logits, noisy_logits, noise_stddev, top_logits
+    #             )
+    #         ).sum(0)
+    #     else:
+    #         load = self._gates_to_load(gates)
+        
+    #      # 软专家
+    #     '''
+    #         两种思路：
+    #         1. 通过设定一个阈值
+    #         2. 直接去掉topk，采用全部softmax=1的
+    #     '''
+    #     # # method1：
+    #     # gates = self.softmax(logits)  # Soft routing: 每个 token 所有专家都有门控值
+
+    #     # z_loss = self.router_z_loss(gates)
+
+    #     # # 不需要 topk、scatter、load = prob_in_top_k
+    #     # load = self._gates_to_load(gates)  # 每个专家的 load = 所有 token 对它的总权重
+        
+    #     # # method2:
+    #     # # Dynamically select experts based on a threshold
+    #     # gates = (logits > self.threshold).float() * logits  # Keep only logits above the threshold
+
+    #     # # Normalize gates for each token
+    #     # gates = gates / (gates.sum(dim=1, keepdim=True) + 1e-6)
+
+    #     # # Compute load for each expert
+    #     # load = gates.sum(0)
+    #     return gates, load,z_loss
+    
     def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
-        """Noisy top-k gating.
-        See paper: https://arxiv.org/abs/1701.06538.
-        Args:
-          x: input Tensor with shape [batch_size, input_size]
-          train: a boolean - we only add noise at training time.
-          noise_epsilon: a float
-        Returns:
-          gates: a Tensor with shape [batch_size, num_experts]
-          load: a Tensor with shape [num_experts]
-        """
         clean_logits = self.gate(x)
 
         if self.noisy_gating and train:
@@ -277,60 +338,71 @@ class Linear_extractor_cluster(nn.Module):
             noise_stddev = self.softplus(raw_noise_stddev) + noise_epsilon
             noise = torch.randn_like(clean_logits)
             noisy_logits = clean_logits + (noise * noise_stddev)
-            logits = noisy_logits @ self.W_h
         else:
-            logits = clean_logits
+            noisy_logits = clean_logits
 
-        # calculate topk + 1 that will be needed for the noisy gates
-       
-        logits = self.softmax(logits)
-        z_loss =self.router_z_loss(logits)
-       
-        top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
+        softmax_logits = F.softmax(noisy_logits, dim=-1)  # 注意这里保留了 softmax logits
+
+        z_loss = self.router_z_loss(softmax_logits)
+
+        top_logits, top_indices = softmax_logits.topk(min(self.k + 1, self.num_experts), dim=1)
         top_k_logits = top_logits[:, : self.k]
         top_k_indices = top_indices[:, : self.k]
-        top_k_gates = top_k_logits / (
-            top_k_logits.sum(1, keepdim=True) + 1e-6
-        )  # normalization
+        top_k_gates = top_k_logits / (top_k_logits.sum(1, keepdim=True) + 1e-6)
 
-        zeros = torch.zeros_like(logits, requires_grad=True)
+        zeros = torch.zeros_like(softmax_logits, requires_grad=True)
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
 
         if self.noisy_gating and self.k < self.num_experts and train:
-            load = (
-                self._prob_in_top_k(
-                    clean_logits, noisy_logits, noise_stddev, top_logits
-                )
-            ).sum(0)
+            load = self._prob_in_top_k(clean_logits, noisy_logits, noise_stddev, top_logits).sum(0)
         else:
             load = self._gates_to_load(gates)
-        
-         # 软专家
-        '''
-            两种思路：
-            1. 通过设定一个阈值
-            2. 直接去掉topk，采用全部softmax=1的
-        '''
-        # # method1：
-        # gates = self.softmax(logits)  # Soft routing: 每个 token 所有专家都有门控值
 
-        # z_loss = self.router_z_loss(gates)
+        return gates, load, z_loss, softmax_logits  # <--- 多返回一个 softmax_logits
 
-        # # 不需要 topk、scatter、load = prob_in_top_k
-        # load = self._gates_to_load(gates)  # 每个专家的 load = 所有 token 对它的总权重
-        
-        # # method2:
-        # # Dynamically select experts based on a threshold
-        # gates = (logits > self.threshold).float() * logits  # Keep only logits above the threshold
+    def load_balancing_loss_func(self, gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2) -> float:
+        r"""
+        Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
 
-        # # Normalize gates for each token
-        # gates = gates / (gates.sum(dim=1, keepdim=True) + 1e-6)
+        See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+        function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+        experts is too unbalanced.
 
-        # # Compute load for each expert
-        # load = gates.sum(0)
-        return gates, load,z_loss
+        Args:
+            gate_logits (Union[torch.Tensor, Tuple[torch.Tensor]):
+                Logits from the gate, should be a tuple of model.config.num_hidden_layers tensors of
+                shape [batch_size X sequence_length, num_experts].
+            num_experts (int, *optional*):
+                Number of experts
 
+        Returns:
+            The auxiliary loss.
+        """
+        if gate_logits is None or not isinstance(gate_logits, tuple):
+            return 0
 
+        if isinstance(gate_logits, tuple):
+            compute_device = gate_logits[0].device
+            concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+        routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+        # treat top_k as tokens (shape is top_k X [batch_size X sequence_length])
+        selected_experts = selected_experts.reshape(-1)
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+        expert_mask = torch.max(expert_mask, dim=-2).values
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+
+        overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(-1))
+        return overall_loss * num_experts
 
     def forward(self, x, loss_coef=1):
         """Args:
@@ -344,12 +416,22 @@ class Linear_extractor_cluster(nn.Module):
         training loss of the model.  The backpropagation of this loss
         encourages all experts to be approximately equally used across a batch.
         """
-        gates, load,z_loss = self.noisy_top_k_gating(x, self.training)
-        # calculate importance loss
-        importance = gates.sum(0)
+        # gates, load,z_loss = self.noisy_top_k_gating(x, self.training)
+        # # calculate importance loss
+        # importance = gates.sum(0)
        
-        loss = self.cv_squared(importance) + self.cv_squared(load)
-        loss *= loss_coef
+        # loss = self.cv_squared(importance) + self.cv_squared(load)
+        # loss *= loss_coef
+        gates, load, z_loss, softmax_logits = self.noisy_top_k_gating(x, self.training)
+
+        # ========== 替换原始 cv_squared 负载均衡损失 ==========
+        load_balance_loss = self.load_balancing_loss_func(
+            gate_logits=(softmax_logits,),  # 包一层 tuple 以兼容函数定义
+            num_experts=self.num_experts,
+            top_k=self.k
+        )
+
+        total_loss = z_loss*0.2 + loss_coef * load_balance_loss
         
         capacity = int((self.capacity_factor * x.shape[0]) // self.num_experts)
         dispatcher = SparseDispatcher(self.num_experts, gates, capacity)
@@ -379,4 +461,4 @@ class Linear_extractor_cluster(nn.Module):
 
         y = dispatcher.combine(expert_outputs) + shared_output
         
-        return y, loss+z_loss*0.2
+        return y, total_loss
